@@ -1,0 +1,37 @@
+[
+  {
+    "id": "sa-native-veg-clearing-permit",
+    "query": "Do I need approval to clear native vegetation in South Australia?",
+    "filters": {"region": "South Australia"},
+    "expected_keywords": ["native vegetation", "clearance", "council"],
+    "reference_answer": "In South Australia, clearing native vegetation generally requires approval/consent under the Native Vegetation Act, administered by the Native Vegetation Council, subject to exemptions."
+  },
+  {
+    "id": "nger-scope1-reporting-threshold",
+    "query": "What is the NGER facility threshold for reporting scope 1 emissions?",
+    "filters": {"jurisdiction": "federal"},
+    "expected_keywords": ["nger", "threshold", "facility"],
+    "reference_answer": "Under NGER, facilities meeting the emissions/energy thresholds (e.g. 25,000 tonnes CO2-e) must report."
+  },
+  {
+    "id": "eia-solar-farm-regional-nsw",
+    "query": "Do I need an environmental impact assessment for a solar farm in regional NSW?",
+    "filters": {"region": "New South Wales"},
+    "expected_keywords": ["assessment", "development", "planning"],
+    "reference_answer": "Large solar farms in NSW are typically assessed as State Significant Development requiring environmental assessment."
+  },
+  {
+    "id": "scope2-market-based-accounting",
+    "query": "Compare location-based and market-based methods for scope 2 emissions and explain when each applies",
+    "filters": {"jurisdiction": "federal"},
+    "expected_keywords": ["scope 2", "market-based", "location-based"],
+    "reference_answer": "Scope 2 can be reported using location-based (grid average) or market-based (contractual instruments) methods; NGER/GHG Protocol define when each applies."
+  },
+  {
+    "id": "heritage-overlay-adelaide",
+    "query": "What are the heritage overlay requirements in the City of Adelaide?",
+    "filters": {"lgas": ["City of Adelaide"]},
+    "expected_keywords": ["heritage", "development", "approval"],
+    "reference_answer": "Development affecting heritage places in the City of Adelaide requires assessment against heritage provisions in the Planning and Design Code."
+  }
+]

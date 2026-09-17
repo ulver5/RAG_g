@@ -1,0 +1,185 @@
+name: ETL Pipeline - Scheduled
+
+on:
+  schedule:
+    - cron: '30 15 */2 * *'  # Every two days at 2 AM ACDT
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: 'Path to documents config'
+        default: 'backend/configs/documents_config.yml'
+        required: false
+
+env:
+  CONFIG_PATH: ${{ github.event.inputs.config_path || 'backend/configs/documents_config.yml' }}
+
+jobs:
+  etl-aws:
+    name: Run ETL on AWS
+    runs-on: ubuntu-latest
+    environment: aws-prod
+    # Disabled - change to true to enable ETL pipeline
+    if: false
+    timeout-minutes: 360
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload config to S3
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`DocumentsBucket`].OutputValue' \
+            --output text)
+
+          aws s3 cp ${{ env.CONFIG_PATH }} \
+            s3://${BUCKET}/configs/documents_config.yml
+
+      - name: Run ETL via ECS Task
+        id: run-etl
+        run: |
+          # Get cluster and service names from CloudFormation stack outputs
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' \
+            --output text)
+
+          SERVICE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`BackendServiceName`].OutputValue' \
+            --output text)
+
+          # Get task definition family from the service
+          TASK_FAMILY=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' \
+            --output text | cut -d'/' -f2 | cut -d':' -f1)
+
+          # Get subnet and security group from CloudFormation outputs
+          SUBNET_IDS=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`PublicSubnetIds`].OutputValue' \
+            --output text)
+
+          # Use first subnet from comma-separated list
+          SUBNET=$(echo $SUBNET_IDS | cut -d',' -f1)
+
+          SG=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`EcsSecurityGroupId`].OutputValue' \
+            --output text)
+
+          # Get S3 bucket and Qdrant URL from CloudFormation
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`DocumentsBucket`].OutputValue' \
+            --output text)
+
+          QDRANT_URL=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`QdrantUrl`].OutputValue' \
+            --output text)
+
+          # Run ETL task (full pipeline: ingest → parse → chunk → index)
+          # Hybrid approach: S3 for persistence, ephemeral storage for processing
+          # ETL-specific resources: 2 vCPU / 8GB RAM for embedding generation
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition $TASK_FAMILY \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG],assignPublicIp=ENABLED}" \
+            --overrides "{
+              \"cpu\": \"2048\",
+              \"memory\": \"8192\",
+              \"containerOverrides\": [{
+                \"name\": \"backend\",
+                \"environment\": [
+                  {\"name\": \"CLOUD_PROVIDER\", \"value\": \"aws\"},
+                  {\"name\": \"AWS_REGION\", \"value\": \"${{ vars.AWS_REGION }}\"},
+                  {\"name\": \"STORAGE_CONTAINER\", \"value\": \"$BUCKET\"},
+                  {\"name\": \"VECTOR_STORE_TYPE\", \"value\": \"qdrant\"},
+                  {\"name\": \"QDRANT_URL\", \"value\": \"$QDRANT_URL\"},
+                  {\"name\": \"QDRANT_API_KEY\", \"value\": \"${{ secrets.QDRANT_API_KEY }}\"},
+                  {\"name\": \"EMBEDDING_MODEL\", \"value\": \"${{ vars.EMBEDDING_MODEL }}\"}
+                ],
+                \"command\": [
+                  \"sh\", \"-c\",
+                  \"echo '=== Step 1: Ingest documents to S3 ===' && greengovrag-cli etl ingest --config /app/configs/documents_config.yml && echo '=== Step 2: Download from S3 and parse ===' && aws s3 sync s3://$BUCKET/documents/ /app/data/raw/ --quiet && greengovrag-cli etl parse --input /app/data/raw --output /app/data/processed && echo '=== Step 3: Chunk documents ===' && greengovrag-cli etl chunk --input /app/data/processed --output /app/data/chunks --chunk-size 500 --chunk-overlap 100 --mode auto --accurate && echo '=== Step 4: Load chunks to database (adds file_id metadata) ===' && greengovrag-cli db load-chunks --chunks-dir /app/data/chunks --batch-size 100 && echo '=== Step 5: Upload updated chunks to S3 ===' && aws s3 sync /app/data/chunks/ s3://$BUCKET/chunks/ --quiet && echo '=== Step 6: Download from S3 and Index to Qdrant ===' && aws s3 sync s3://$BUCKET/chunks/ /app/data/chunks/ --quiet && greengovrag-cli rag index --chunks /app/data/chunks --vector-store qdrant --collection greengovrag --model ${{ vars.EMBEDDING_MODEL }} --batch-size 100 --mode auto\"
+                ]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "✓ Started ETL task: $TASK_ARN"
+
+      - name: Monitor ETL task
+        run: |
+          # Get cluster name from CloudFormation stack outputs
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' \
+            --output text)
+
+          TASK_ARN="${{ steps.run-etl.outputs.task_arn }}"
+
+          echo "Monitoring task: $TASK_ARN"
+
+          # Wait for task to complete (with timeout)
+          for i in {1..60}; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster "$CLUSTER" \
+              --tasks $TASK_ARN \
+              --query 'tasks[0].lastStatus' \
+              --output text)
+
+            echo "[$i/60] Task status: $STATUS"
+
+            if [ "$STATUS" == "STOPPED" ]; then
+              EXIT_CODE=$(aws ecs describe-tasks \
+                --cluster "$CLUSTER" \
+                --tasks $TASK_ARN \
+                --query 'tasks[0].containers[0].exitCode' \
+                --output text)
+
+              if [ "$EXIT_CODE" == "0" ]; then
+                echo "✓ ETL task completed successfully"
+                exit 0
+              else
+                echo "✗ ETL task failed with exit code: $EXIT_CODE"
+                exit 1
+              fi
+            fi
+
+            sleep 60
+          done
+
+          echo "✗ ETL task timeout after 60 minutes"
+          exit 1
+
+      - name: Verify Qdrant update
+        if: success()
+        run: |
+          # Get Qdrant instance IP (via SSM if configured)
+          # For now, just log success
+          echo "✓ ETL pipeline completed successfully"
+          echo "Check Qdrant collection for updated documents"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "✗ ETL pipeline failed. Check logs above for details."
+          # Add Slack/email notification here

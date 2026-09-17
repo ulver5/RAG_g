@@ -1,0 +1,164 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'data/geo/**'
+      - '.github/workflows/aws-deploy-frontend.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  # Ensure CI tests pass before deploying
+  ci-frontend:
+    uses: ./.github/workflows/ci-frontend.yml
+
+  build:
+    # Disabled - change to true to enable deployment
+    if: false
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    environment: aws-prod
+    needs: ci-frontend  # Wait for tests to pass
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Generate runtime config template
+        working-directory: frontend
+        run: |
+          # Copy config template to dist
+          cp public/config.template.js dist/config.js
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+          retention-days: 1
+
+  deploy-aws:
+    name: Deploy to AWS S3 + CloudFront
+    needs: build
+    runs-on: ubuntu-latest
+    environment: aws-prod
+    # NOTE: This job only runs if backend deployment succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: dist/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Get CloudFormation outputs
+        id: cf-outputs
+        run: |
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucket`].OutputValue' \
+            --output text)
+
+          CF_URL=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontURL`].OutputValue' \
+            --output text)
+
+          CF_DISTRIBUTION_ID=$(aws cloudformation describe-stacks \
+            --stack-name GreenGovRAGStack \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDistributionId`].OutputValue' \
+            --output text)
+
+          echo "bucket=$FRONTEND_BUCKET" >> $GITHUB_OUTPUT
+          echo "cf_url=$CF_URL" >> $GITHUB_OUTPUT
+          echo "cf_distribution_id=$CF_DISTRIBUTION_ID" >> $GITHUB_OUTPUT
+
+      - name: Generate runtime config.js
+        run: |
+          cat > dist/config.js << EOF
+          // Runtime configuration for GreenGovRAG frontend
+          // API_ACCESS_KEY is NOT included here - it's securely injected by CloudFront Function
+          // The CDK stack deploys a CloudFront Function that adds the X-API-Key header to all /api/* requests
+          // CloudFront routes /api/* requests to the ALB backend
+          window.__RUNTIME_CONFIG__ = {
+            API_URL: '${{ steps.cf-outputs.outputs.cf_url }}/api',
+            CDN_URL: '${{ steps.cf-outputs.outputs.cf_url }}',
+            MAPBOX_TOKEN: '${{ secrets.VITE_MAPBOX_TOKEN || 'pk.your-mapbox-token-here' }}',
+            GITHUB_REPO_URL: 'https://github.com/sdp5/green-gov-rag'
+          };
+          EOF
+
+      - name: Checkout code (for GeoJSON data)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync dist/ s3://${{ steps.cf-outputs.outputs.bucket }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "index.html" \
+            --exclude "config.js"
+
+          # Upload index.html and config.js with no-cache
+          aws s3 cp dist/index.html s3://${{ steps.cf-outputs.outputs.bucket }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          aws s3 cp dist/config.js s3://${{ steps.cf-outputs.outputs.bucket }}/config.js \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Upload static GeoJSON to S3
+        run: |
+          # Gzip the file for better compression (9MB -> ~2MB)
+          gzip -c repo/data/geo/aus_lga.geojson > aus_lga.geojson.gz
+
+          # Upload LGA boundaries GeoJSON with long cache (30 days) and gzip encoding
+          aws s3 cp aus_lga.geojson.gz s3://${{ steps.cf-outputs.outputs.bucket }}/data/geo/aus_lga.geojson \
+            --content-type "application/geo+json" \
+            --content-encoding gzip \
+            --cache-control "public, max-age=2592000"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          # Use distribution ID from CloudFormation output
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.cf-outputs.outputs.cf_distribution_id }} \
+            --paths "/*"
+
+          echo "✓ CloudFront cache invalidated"
+
+      - name: Deployment summary
+        run: |
+          echo "✓ Frontend deployed successfully"
+          echo "URL: ${{ steps.cf-outputs.outputs.cf_url }}"

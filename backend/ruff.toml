@@ -1,0 +1,34 @@
+# Additional ruff configuration to temporarily ignore less critical warnings
+# These should be fixed over time
+
+# Extend per-file ignores
+[lint.per-file-ignores]
+"tests/*" = [
+    "ARG005",  # Unused lambda argument
+    "BLE001",  # Do not catch blind exception - acceptable in tests
+    "PLR2004", # Magic value used in comparison
+    "SIM117",  # Use a single with - acceptable in tests
+]
+
+"green_gov_rag/airflow/**" = [
+    "AIR001",  # Airflow task variable names
+    "T201",    # print found - acceptable in Airflow
+    "PLW1514", # open in text mode - acceptable in specific cases
+    "SIM115",  # Use context handler
+    "PTH123",  # Use Path.open()
+]
+
+"green_gov_rag/app/*" = [
+    "C901",    # Function too complex - UI code
+    "PLR0915", # Too many statements
+    "PLR0914", # Too many local variables
+    "ARG005",  # Unused lambda argument
+]
+
+"green_gov_rag/scripts/*" = [
+    "T201",    # print found - acceptable in scripts
+]
+
+"green_gov_rag/cloud/storage.py" = [
+    "PTH123",  # Use Path.open() - acceptable with explicit compatibility
+]

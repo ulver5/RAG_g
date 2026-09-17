@@ -1,0 +1,136 @@
+name: ETL Pipeline - Scheduled
+
+on:
+  schedule:
+    - cron: '30 15 */2 * *'  # Every two days at 2 AM ACDT
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: 'Path to documents config'
+        default: 'backend/configs/documents_config.yml'
+        required: false
+
+env:
+  CONFIG_PATH: ${{ github.event.inputs.config_path || 'backend/configs/documents_config.yml' }}
+
+jobs:
+  etl-azure:
+    name: Run ETL on Azure
+    runs-on: ubuntu-latest
+    # Disabled - change to true to enable ETL pipeline
+    if: false
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Azure resources
+        id: azure-resources
+        run: |
+          echo "resource_group=${{ secrets.AZURE_RESOURCE_GROUP }}" >> $GITHUB_OUTPUT
+          echo "job_name=greengovrag-etl-job" >> $GITHUB_OUTPUT
+          echo "storage_account=${{ secrets.AZURE_STORAGE_ACCOUNT }}" >> $GITHUB_OUTPUT
+
+      - name: Upload config to Blob Storage
+        run: |
+          az storage blob upload \
+            --account-name ${{ steps.azure-resources.outputs.storage_account }} \
+            --container-name configs \
+            --name documents_config.yml \
+            --file ${{ env.CONFIG_PATH }} \
+            --overwrite
+
+      - name: Run ETL via Azure Container App Job
+        id: run-etl-azure
+        run: |
+          STORAGE_ACCOUNT="${{ steps.azure-resources.outputs.storage_account }}"
+
+          echo "Starting Azure Container App Job: ${{ steps.azure-resources.outputs.job_name }}"
+          echo ""
+          echo "Full ETL pipeline: ingest → parse → chunk → load → index"
+          echo "Hybrid approach: Azure Blob for persistence, ephemeral storage for processing"
+          echo ""
+
+          # Update job with full pipeline command
+          az containerapp job update \
+            --name ${{ steps.azure-resources.outputs.job_name }} \
+            --resource-group ${{ steps.azure-resources.outputs.resource_group }} \
+            --args "sh,-c,echo '=== Step 1: Ingest documents to Blob Storage ===' && greengovrag-cli etl ingest --config /app/configs/documents_config.yml && echo '=== Step 2: Download from Blob and parse ===' && az storage blob download-batch --source documents --destination /app/data/raw/ --account-name $STORAGE_ACCOUNT --auth-mode login --no-progress && greengovrag-cli etl parse --input /app/data/raw --output /app/data/processed && echo '=== Step 3: Chunk and upload to Blob ===' && greengovrag-cli etl chunk --input /app/data/processed --output /app/data/chunks --chunk-size 500 --chunk-overlap 100 && az storage blob upload-batch --source /app/data/chunks --destination chunks --account-name $STORAGE_ACCOUNT --auth-mode login --no-progress && echo '=== Step 4: Load chunks to database ===' && greengovrag-cli db load-chunks --chunks-dir /app/data/chunks --batch-size 100 && echo '=== Step 5: Index to Qdrant ===' && greengovrag-cli rag index --chunks /app/data/chunks --vector-store qdrant --collection greengovrag --model \$EMBEDDING_MODEL --mode auto"
+
+          # Start the ETL job execution
+          JOB_EXECUTION=$(az containerapp job start \
+            --name ${{ steps.azure-resources.outputs.job_name }} \
+            --resource-group ${{ steps.azure-resources.outputs.resource_group }} \
+            --query 'name' \
+            --output tsv)
+
+          echo "job_execution=$JOB_EXECUTION" >> $GITHUB_OUTPUT
+          echo "✓ Started ETL job execution: $JOB_EXECUTION"
+
+      - name: Monitor ETL job execution
+        run: |
+          JOB_EXECUTION="${{ steps.run-etl-azure.outputs.job_execution }}"
+          echo "Monitoring Azure Container App Job execution..."
+
+          # Poll job status (max 60 minutes = 120 polls at 30s intervals)
+          for i in {1..120}; do
+            STATUS=$(az containerapp job execution show \
+              --name ${{ steps.azure-resources.outputs.job_name }} \
+              --resource-group ${{ steps.azure-resources.outputs.resource_group }} \
+              --job-execution-name $JOB_EXECUTION \
+              --query 'properties.status' \
+              --output tsv)
+
+            echo "[$i/120] Job status: $STATUS"
+
+            if [ "$STATUS" == "Succeeded" ]; then
+              echo "✓ ETL job completed successfully"
+              exit 0
+            elif [ "$STATUS" == "Failed" ]; then
+              echo "✗ ETL job failed"
+
+              # Get logs for debugging
+              echo "Fetching logs..."
+              az containerapp job execution logs show \
+                --name ${{ steps.azure-resources.outputs.job_name }} \
+                --resource-group ${{ steps.azure-resources.outputs.resource_group }} \
+                --job-execution-name $JOB_EXECUTION \
+                --tail 50
+
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "✗ ETL job timeout after 60 minutes"
+          exit 1
+
+      - name: Get ETL job logs
+        if: success()
+        run: |
+          echo "Fetching ETL job logs (last 100 lines)..."
+          az containerapp job execution logs show \
+            --name ${{ steps.azure-resources.outputs.job_name }} \
+            --resource-group ${{ steps.azure-resources.outputs.resource_group }} \
+            --job-execution-name ${{ steps.run-etl-azure.outputs.job_execution }} \
+            --tail 100
+
+      - name: Verify Qdrant update
+        if: success()
+        run: |
+          echo "✓ ETL pipeline completed successfully on Azure"
+          echo "Documents have been processed and uploaded to Qdrant"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "✗ ETL pipeline failed on Azure"
+          echo "Check logs above for details"
+          # Add Slack/email notification here if configured

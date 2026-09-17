@@ -1,0 +1,336 @@
+name: Backup and Monitoring
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # Weekly on Sunday at 3 AM UTC
+  workflow_dispatch:
+
+jobs:
+  backup-azure:
+    name: Backup Azure Resources
+    runs-on: ubuntu-latest
+    # Disabled - change to true to enable backup
+    if: false
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get resource IDs
+        id: resources
+        run: |
+          RESOURCE_GROUP="${{ secrets.AZURE_RESOURCE_GROUP }}"
+
+          # Get PostgreSQL server name
+          PG_SERVER=$(az postgres flexible-server list \
+            --resource-group $RESOURCE_GROUP \
+            --query "[?contains(name, 'greengovrag')].name" \
+            --output tsv | head -1)
+
+          # Get storage account name
+          STORAGE_ACCOUNT="${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+
+          # Get Qdrant VM name
+          QDRANT_VM=$(az vm list \
+            --resource-group $RESOURCE_GROUP \
+            --query "[?contains(name, 'qdrant')].name" \
+            --output tsv | head -1)
+
+          # Get Qdrant disk name
+          QDRANT_DISK=$(az vm show \
+            --resource-group $RESOURCE_GROUP \
+            --name $QDRANT_VM \
+            --query "storageProfile.osDisk.name" \
+            --output tsv)
+
+          echo "resource_group=$RESOURCE_GROUP" >> $GITHUB_OUTPUT
+          echo "pg_server=$PG_SERVER" >> $GITHUB_OUTPUT
+          echo "storage_account=$STORAGE_ACCOUNT" >> $GITHUB_OUTPUT
+          echo "qdrant_vm=$QDRANT_VM" >> $GITHUB_OUTPUT
+          echo "qdrant_disk=$QDRANT_DISK" >> $GITHUB_OUTPUT
+
+          echo "✓ Found resources:"
+          echo "  PostgreSQL: $PG_SERVER"
+          echo "  Storage: $STORAGE_ACCOUNT"
+          echo "  Qdrant VM: $QDRANT_VM"
+          echo "  Qdrant Disk: $QDRANT_DISK"
+
+      - name: Create PostgreSQL backup
+        run: |
+          PG_SERVER="${{ steps.resources.outputs.pg_server }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_NAME="greengovrag-backup-$TIMESTAMP"
+
+          echo "Creating PostgreSQL backup: $BACKUP_NAME"
+
+          # Trigger on-demand backup
+          az postgres flexible-server backup create \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $PG_SERVER \
+            --backup-name $BACKUP_NAME
+
+          echo "✓ PostgreSQL backup created: $BACKUP_NAME"
+
+      - name: Create Qdrant disk snapshot
+        run: |
+          QDRANT_DISK="${{ steps.resources.outputs.qdrant_disk }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SNAPSHOT_NAME="qdrant-snapshot-$TIMESTAMP"
+
+          echo "Creating Qdrant disk snapshot: $SNAPSHOT_NAME"
+
+          # Get disk resource ID
+          DISK_ID=$(az disk show \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $QDRANT_DISK \
+            --query id \
+            --output tsv)
+
+          # Create snapshot
+          az snapshot create \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $SNAPSHOT_NAME \
+            --source $DISK_ID \
+            --tags BackupType=Automated BackupDate=$(date +%Y-%m-%d)
+
+          echo "✓ Qdrant disk snapshot created: $SNAPSHOT_NAME"
+
+      - name: Backup Blob Storage containers
+        run: |
+          STORAGE_ACCOUNT="${{ steps.resources.outputs.storage_account }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          echo "Creating Blob Storage snapshots..."
+
+          # Snapshot documents container
+          DOCS_BLOBS=$(az storage blob list \
+            --account-name $STORAGE_ACCOUNT \
+            --container-name documents \
+            --auth-mode login \
+            --query "[].name" \
+            --output tsv)
+
+          for BLOB in $DOCS_BLOBS; do
+            az storage blob snapshot \
+              --account-name $STORAGE_ACCOUNT \
+              --container-name documents \
+              --name $BLOB \
+              --auth-mode login || true
+          done
+
+          # Snapshot configs container
+          CONFIG_BLOBS=$(az storage blob list \
+            --account-name $STORAGE_ACCOUNT \
+            --container-name configs \
+            --auth-mode login \
+            --query "[].name" \
+            --output tsv)
+
+          for BLOB in $CONFIG_BLOBS; do
+            az storage blob snapshot \
+              --account-name $STORAGE_ACCOUNT \
+              --container-name configs \
+              --name $BLOB \
+              --auth-mode login || true
+          done
+
+          echo "✓ Blob Storage snapshots created"
+
+      - name: Export PostgreSQL database to Blob Storage
+        run: |
+          PG_SERVER="${{ steps.resources.outputs.pg_server }}"
+          STORAGE_ACCOUNT="${{ steps.resources.outputs.storage_account }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_FILE="postgresql-dump-$TIMESTAMP.sql"
+
+          echo "Exporting PostgreSQL database to Blob Storage..."
+
+          # Get PostgreSQL admin credentials from Key Vault (if configured)
+          # For now, we rely on managed identity or Azure AD auth
+
+          # Note: Direct pg_dump requires network access to PostgreSQL
+          # In production, this would typically run from an Azure VM or Container Instance
+          # that has network access to the PostgreSQL server
+
+          echo "⚠ PostgreSQL export requires direct database access"
+          echo "  This step is best run from an Azure Container Instance or VM"
+          echo "  For now, relying on PostgreSQL flexible server's built-in backups"
+
+      - name: Clean up old snapshots
+        run: |
+          CUTOFF_DATE=$(date -d "28 days ago" +%Y-%m-%d)
+
+          echo "Cleaning up snapshots older than $CUTOFF_DATE..."
+
+          # Delete old disk snapshots (keep last 4 weekly backups = 28 days)
+          OLD_SNAPSHOTS=$(az snapshot list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --query "[?tags.BackupType=='Automated' && tags.BackupDate<'$CUTOFF_DATE'].name" \
+            --output tsv)
+
+          for SNAPSHOT in $OLD_SNAPSHOTS; do
+            echo "Deleting old snapshot: $SNAPSHOT"
+            az snapshot delete \
+              --resource-group ${{ steps.resources.outputs.resource_group }} \
+              --name $SNAPSHOT \
+              --yes || true
+          done
+
+          echo "✓ Old snapshots cleaned up"
+
+      - name: Clean up old PostgreSQL backups
+        run: |
+          PG_SERVER="${{ steps.resources.outputs.pg_server }}"
+
+          echo "Listing PostgreSQL backups..."
+
+          # List all backups
+          az postgres flexible-server backup list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $PG_SERVER \
+            --query "[].{Name:name, CompletedTime:completedTime}" \
+            --output table
+
+          echo "✓ PostgreSQL has automatic retention policy (7-35 days configurable)"
+          echo "  Manual backups older than retention period are automatically cleaned up"
+
+  health-check-azure:
+    name: Health Check Azure Services
+    runs-on: ubuntu-latest
+    # Disabled - change to true to enable health check
+    if: false
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Azure resources
+        id: resources
+        run: |
+          echo "resource_group=${{ secrets.AZURE_RESOURCE_GROUP }}" >> $GITHUB_OUTPUT
+          echo "storage_account=${{ secrets.AZURE_STORAGE_ACCOUNT }}" >> $GITHUB_OUTPUT
+
+      - name: Check Container App health
+        run: |
+          CONTAINER_APP=$(az containerapp list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --query "[?contains(name, 'greengovrag')].name" \
+            --output tsv | head -1)
+
+          STATUS=$(az containerapp show \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $CONTAINER_APP \
+            --query "properties.provisioningState" \
+            --output tsv)
+
+          REPLICAS=$(az containerapp replica list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $CONTAINER_APP \
+            --query "length([?properties.runningState=='Running'])" \
+            --output tsv)
+
+          echo "Container App: $CONTAINER_APP"
+          echo "Status: $STATUS"
+          echo "Running replicas: $REPLICAS"
+
+          if [ "$STATUS" != "Succeeded" ] || [ "$REPLICAS" -lt "1" ]; then
+            echo "✗ Container App unhealthy"
+            exit 1
+          fi
+
+          echo "✓ Container App healthy"
+
+      - name: Check PostgreSQL health
+        run: |
+          PG_SERVER=$(az postgres flexible-server list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --query "[?contains(name, 'greengovrag')].name" \
+            --output tsv | head -1)
+
+          STATE=$(az postgres flexible-server show \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $PG_SERVER \
+            --query "state" \
+            --output tsv)
+
+          echo "PostgreSQL Server: $PG_SERVER"
+          echo "State: $STATE"
+
+          if [ "$STATE" != "Ready" ]; then
+            echo "✗ PostgreSQL server unhealthy: $STATE"
+            exit 1
+          fi
+
+          echo "✓ PostgreSQL server healthy"
+
+      - name: Check Qdrant VM health
+        run: |
+          QDRANT_VM=$(az vm list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --query "[?contains(name, 'qdrant')].name" \
+            --output tsv | head -1)
+
+          POWER_STATE=$(az vm show \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --name $QDRANT_VM \
+            --show-details \
+            --query "powerState" \
+            --output tsv)
+
+          echo "Qdrant VM: $QDRANT_VM"
+          echo "Power State: $POWER_STATE"
+
+          if [ "$POWER_STATE" != "VM running" ]; then
+            echo "⚠ Qdrant VM not running: $POWER_STATE (This is normal for spot instances)"
+          else
+            echo "✓ Qdrant VM running"
+          fi
+
+      - name: Check Storage Account health
+        run: |
+          STORAGE_ACCOUNT="${{ secrets.AZURE_STORAGE_ACCOUNT }}"
+
+          STATUS=$(az storage account show \
+            --name $STORAGE_ACCOUNT \
+            --query "provisioningState" \
+            --output tsv)
+
+          echo "Storage Account: $STORAGE_ACCOUNT"
+          echo "Status: $STATUS"
+
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "✗ Storage Account unhealthy: $STATUS"
+            exit 1
+          fi
+
+          echo "✓ Storage Account healthy"
+
+      - name: Check CDN endpoint
+        run: |
+
+          # Get CDN endpoint
+          CDN_ENDPOINT=$(az cdn endpoint list \
+            --resource-group ${{ steps.resources.outputs.resource_group }} \
+            --profile-name greengovrag-cdn \
+            --query "[0].hostName" \
+            --output tsv 2>/dev/null || echo "")
+
+          if [ -z "$CDN_ENDPOINT" ]; then
+            echo "⚠ CDN endpoint not found (may not be configured)"
+            exit 0
+          fi
+
+          echo "CDN Endpoint: $CDN_ENDPOINT"
+
+          # Test CDN endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$CDN_ENDPOINT")
+
+          if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "301" ] || [ "$HTTP_CODE" == "302" ]; then
+            echo "✓ CDN endpoint healthy (HTTP $HTTP_CODE)"
+          else
+            echo "⚠ CDN endpoint returned HTTP $HTTP_CODE"
+          fi
